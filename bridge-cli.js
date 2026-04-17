@@ -200,6 +200,10 @@ program
     try {
       const data = await waitForData(60000);
       spinner.succeed(`"${data.title || '?'}" — ${(data.chapters || []).length} chapter`);
+      if (data.debugHrefs && (!data.chapters || !data.chapters.length)) {
+        console.log(chalk.yellow('\n  ⚠ 0 chapters. Sample hrefs trên trang:'));
+        (data.debugHrefs || []).forEach(h => console.log(chalk.gray('    ' + h)));
+      }
       printChapterTable(data.chapters);
     } catch (err) {
       spinner.fail(err.message);

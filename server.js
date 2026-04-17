@@ -132,9 +132,15 @@ async function startServer() {
 
 async function stopServer() {
   if (_server) {
+    // Force-close tất cả keep-alive connections (Node 18.2+)
+    if (typeof _server.closeAllConnections === 'function') {
+      _server.closeAllConnections();
+    }
     await new Promise(r => _server.close(r));
     _server = null;
   }
+  // Đảm bảo process thoát hoàn toàn
+  setImmediate(() => process.exit(0));
 }
 
 /**
