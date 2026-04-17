@@ -1,0 +1,29 @@
+{
+  "manifest_version": 3,
+  "name": "Newtoki Bridge",
+  "version": "1.0",
+  "description": "Bridge extension to scrape Newtoki data for the CLI tool",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "cookies",
+    "storage"
+  ],
+  "host_permissions": [
+    "*://*.newtoki*.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Newtoki Bridge"
+  },
+  "content_scripts": [
+    {
+      "matches": ["*://*.newtoki*.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
