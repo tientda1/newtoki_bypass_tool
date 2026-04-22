@@ -1,0 +1,8 @@
+node_modules/
+.env
+.browser-profile/
+.chrome-temp-profile/
+downloads/
+debug-dump.html
+newtoki-cookies.json
+*.zip
