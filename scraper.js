@@ -1,7 +1,9 @@
 /**
- * scraper.js — Newtoki Scraper
- * Lấy danh sách truyện, chapters, và URL ảnh
- * Logic ảnh lấy từ NewtokiRipper-1.5 (data-* attribute trên <img>)
+ * scraper.js — Newtoki Scraper (v2 — với CAPTCHA handling)
+ *
+ * Lấy danh sách truyện, chapters, và URL ảnh.
+ * Logic ảnh từ NewtokiRipper-1.5 (data-* attribute trên <img>)
+ * Tích hợp CAPTCHA detection + Ollama Gemma 4 fallback.
  */
 
 'use strict';
@@ -24,14 +26,16 @@ function getBaseUrl() {
 
 /**
  * Tìm domain Newtoki đang hoạt động tự động
- * Thử từ số cao xuống thấp
+ * @param {Page} page
+ * @param {number} startNum
+ * @param {object} navOptions - options truyền vào navigateTo (ollamaModule, aiModel)
  */
-async function findActiveNewtoki(page, startNum = 470) {
+async function findActiveNewtoki(page, startNum = 470, navOptions = {}) {
   for (let n = startNum; n >= 400; n--) {
     const url = `https://newtoki${n}.com/webtoon`;
     try {
       console.log(`  Thử ${url}...`);
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 8000 });
+      await navigateTo(page, url, { ...navOptions, timeout: 8000, maxRetries: 1 });
       const status = await page.evaluate(() => ({
         title: document.title,
         hasContent: !!document.querySelector('.section-list, .webtoon-list, #content'),
@@ -54,74 +58,47 @@ async function findActiveNewtoki(page, startNum = 470) {
 
 /**
  * Tìm kiếm truyện theo keyword
+ * @param {Page} page
+ * @param {string} keyword
+ * @param {object} navOptions
  * @returns {Array<{title, url, author, genre, status, thumbnail}>}
  */
-async function searchManga(page, keyword) {
+async function searchManga(page, keyword, navOptions = {}) {
   const base = getBaseUrl();
   if (!base) throw new Error('Chưa set base URL. Hãy dùng --domain hoặc --find-domain trước.');
 
   const searchUrl = `${base}/webtoon?stx=${encodeURIComponent(keyword)}`;
-  await navigateTo(page, searchUrl);
+  await navigateTo(page, searchUrl, navOptions);
 
   const results = await page.evaluate(() => {
     const items = [];
+    const seen = new Set();
 
-    // Selector phổ biến của Newtoki cho danh sách truyện
-    const selectors = [
-      '.section-list .item',
-      '.webtoon-list .item',
-      '.list-item',
-      'li.list-item',
-      '.comic-list .item',
+    // Newtoki dùng /webtoon/12345 hoặc /webtoon/view/12345
+    const links = [
+      ...document.querySelectorAll('a[href*="/webtoon/view/"]'),
+      ...document.querySelectorAll('a[href*="/webtoon/"]'),
     ];
 
-    let container = null;
-    for (const sel of selectors) {
-      const found = document.querySelectorAll(sel);
-      if (found.length > 0) {
-        container = found;
-        break;
-      }
-    }
+    for (const link of links) {
+      if (seen.has(link.href)) continue;
+      // Phải có ít nhất 2 path segment (loại link nav /webtoon)
+      const parts = new URL(link.href).pathname.split('/').filter(Boolean);
+      if (parts.length < 2) continue;
+      seen.add(link.href);
 
-    // Fallback: tìm thẻ a có href chứa /webtoon/view/
-    if (!container || container.length === 0) {
-      const links = document.querySelectorAll('a[href*="/webtoon/view/"]');
-      links.forEach((link) => {
-        const img = link.querySelector('img');
-        const titleEl = link.querySelector('.item-subject, .title, h3, h4, .subject');
-        items.push({
-          title: titleEl ? titleEl.textContent.trim() : link.textContent.trim(),
-          url: link.href,
-          thumbnail: img ? (img.dataset.src || img.src) : null,
-          author: '',
-          genre: '',
-          status: '',
-        });
-      });
-      return items;
-    }
-
-    container.forEach((el) => {
-      const link = el.querySelector('a[href*="/webtoon/view/"]') || el.querySelector('a');
-      if (!link) return;
-
-      const img = el.querySelector('img');
-      const titleEl = el.querySelector('.item-subject, .title, h3, h4, .subject, .toon-subject');
-      const authorEl = el.querySelector('.author, .item-author');
-      const genreEl = el.querySelector('.genre, .item-genre');
-      const statusEl = el.querySelector('.status, .item-status');
+      const container = link.closest('li, .item, article, div[class*="item"]') || link;
+      const img = container.querySelector('img');
+      const titleEl = container.querySelector('.subject, .title, h3, h4, [class*="subject"], [class*="title"]');
+      const title = titleEl ? titleEl.textContent.trim() : link.textContent.trim().substring(0, 80);
+      if (!title || title.length < 2) continue;
 
       items.push({
-        title: titleEl ? titleEl.textContent.trim() : link.textContent.trim(),
+        title,
         url: link.href,
-        thumbnail: img ? (img.dataset.src || img.src) : null,
-        author: authorEl ? authorEl.textContent.trim() : '',
-        genre: genreEl ? genreEl.textContent.trim() : '',
-        status: statusEl ? statusEl.textContent.trim() : '',
+        thumbnail: img ? (img.dataset.src || img.dataset.original || img.getAttribute('data-src') || img.src) : null,
       });
-    });
-
+    }
     return items;
   });
 
@@ -130,9 +107,11 @@ async function searchManga(page, keyword) {
 
 /**
  * Duyệt trang đầu hoặc danh mục
- * @param {string} category - 'all' | 'week' | 'finish' | tên thể loại
+ * @param {Page} page
+ * @param {object} options
+ * @param {object} navOptions
  */
-async function browseManga(page, options = {}) {
+async function browseManga(page, options = {}, navOptions = {}) {
   const base = getBaseUrl();
   if (!base) throw new Error('Chưa set base URL.');
 
@@ -141,27 +120,33 @@ async function browseManga(page, options = {}) {
   if (category) url += `?toon=${category}`;
   if (pageNum > 1) url += `${category ? '&' : '?'}page=${pageNum}`;
 
-  await navigateTo(page, url);
+  await navigateTo(page, url, navOptions);
 
-  // Chờ Cloudflare pass: chờ cho đến khi xuất hiện link đến /webtoon/ hoặc timeout
+  // Chờ content load
   try {
     await page.waitForFunction(
-      () => document.querySelectorAll('a[href*="/webtoon/"]').length > 0,
+      () => document.querySelectorAll('a[href*="/webtoon/"]').length > 2,
       { timeout: 15000, polling: 1000 }
     );
-  } catch {
-    // Chấp nhận nếu timeout — sẽ trả rỗng
-  }
+  } catch { /* Chấp nhận nếu timeout */ }
 
   const results = await page.evaluate(() => {
     const items = [];
-
-    // Thử nhiều selector theo cấu trúc Newtoki
-    const links = document.querySelectorAll('a[href*="/webtoon/view/"]');
     const seen = new Set();
 
-    links.forEach((link) => {
-      if (seen.has(link.href)) return;
+    // Newtoki dùng /webtoon/12345 hoặc /webtoon/view/12345
+    const links = [
+      ...document.querySelectorAll('a[href*="/webtoon/view/"]'),
+      ...document.querySelectorAll('a[href*="/webtoon/"]'),
+    ];
+
+    for (const link of links) {
+      if (seen.has(link.href)) continue;
+      // Loại nav link chỉ có 1 segment (/webtoon)
+      try {
+        const parts = new URL(link.href).pathname.split('/').filter(Boolean);
+        if (parts.length < 2) continue;
+      } catch { continue; }
       seen.add(link.href);
 
       const container = link.closest('li, .item, article, .toon-item, div[class*="item"]') || link;
@@ -170,23 +155,19 @@ async function browseManga(page, options = {}) {
         '.subject, .title, h3, h4, [class*="title"], [class*="subject"], [class*="toon"]'
       );
       const updateEl = container.querySelector('.update, .date, [class*="update"], time');
-      const badgeEl = container.querySelector('.badge, .label, .new, [class*="badge"]');
 
-      const rawTitle = titleEl
+      const title = titleEl
         ? titleEl.textContent.trim()
         : link.textContent.trim().substring(0, 60);
-
-      // Bỏ qua nếu title quá ngắn (có thể là icon/nút)
-      if (!rawTitle || rawTitle.length < 1) return;
+      if (!title || title.length < 2) continue;
 
       items.push({
-        title: rawTitle,
+        title,
         url: link.href,
-        thumbnail: img ? (img.dataset.src || img.getAttribute('data-original') || img.src) : null,
+        thumbnail: img ? (img.dataset.src || img.getAttribute('data-original') || img.getAttribute('data-src') || img.src) : null,
         lastUpdate: updateEl ? updateEl.textContent.trim() : '',
-        badge: badgeEl ? badgeEl.textContent.trim() : '',
       });
-    });
+    }
 
     return items;
   });
@@ -200,19 +181,21 @@ async function browseManga(page, options = {}) {
 
 /**
  * Lấy danh sách chapter từ trang manga
- * @returns {Array<{title, url, number, date}>}
+ * @param {Page} page
+ * @param {string} mangaUrl
+ * @param {object} navOptions
+ * @returns {{ title: string, chapters: Array<{title, url, number, date}> }}
  */
-async function getChapterList(page, mangaUrl) {
-  await navigateTo(page, mangaUrl);
+async function getChapterList(page, mangaUrl, navOptions = {}) {
+  await navigateTo(page, mangaUrl, navOptions);
 
   const result = await page.evaluate(() => {
     const chapters = [];
-
-    // Selector cho list chapter
     const selectors = [
       '.serial-list .item',
       '.chapter-list li',
       '.list-item-view',
+      '.list-item',
       'ul.list li',
       '.view-lst li',
     ];
@@ -220,10 +203,7 @@ async function getChapterList(page, mangaUrl) {
     let found = null;
     for (const sel of selectors) {
       const els = document.querySelectorAll(sel);
-      if (els.length > 0) {
-        found = els;
-        break;
-      }
+      if (els.length > 0) { found = els; break; }
     }
 
     // Fallback: link chứa /webtoon/view/ với số
@@ -238,18 +218,16 @@ async function getChapterList(page, mangaUrl) {
           date: '',
         });
       });
-      return chapters.reverse(); // Thường list từ mới → cũ, đảo lại
+      return chapters.reverse();
     }
 
     found.forEach((el, i) => {
       const link = el.querySelector('a');
       if (!link) return;
-
       const titleEl = el.querySelector('.title, .subject, .toon-subject, span');
-      const dateEl = el.querySelector('.date, .num-date, time');
-      const numEl = el.querySelector('.num, [class*="num"], .episode');
+      const dateEl  = el.querySelector('.date, .num-date, time');
+      const numEl   = el.querySelector('.num, [class*="num"], .episode');
       const numMatch = link.href.match(/\/(\d+)(?:\?|$)/);
-
       chapters.push({
         title: titleEl ? titleEl.textContent.trim() : link.textContent.trim().substring(0, 80),
         url: link.href,
@@ -261,7 +239,6 @@ async function getChapterList(page, mangaUrl) {
     return chapters.reverse();
   });
 
-  // Lấy thêm thông tin manga (title)
   const mangaTitle = await page.evaluate(() => {
     const selectors = ['.view-title', 'h1', '.subject', '.toon-title', '.title-subject'];
     for (const sel of selectors) {
@@ -280,11 +257,13 @@ async function getChapterList(page, mangaUrl) {
 
 /**
  * Lấy URLs ảnh từ chapter
- * Port từ hàm getImages() trong NewtokiRipper-1.5:
- * - Tìm img có data-* attribute chứa URL bắt đầu bằng https://img và chứa "newtoki"
+ * @param {Page} page
+ * @param {string} chapterUrl
+ * @param {object} navOptions
+ * @returns {{ title: string, imageUrls: string[] }}
  */
-async function getImageUrls(page, chapterUrl) {
-  await navigateTo(page, chapterUrl);
+async function getImageUrls(page, chapterUrl, navOptions = {}) {
+  await navigateTo(page, chapterUrl, navOptions);
 
   // Scroll xuống để lazy-load ảnh
   await autoScroll(page);
@@ -293,7 +272,7 @@ async function getImageUrls(page, chapterUrl) {
     const imgs = [...document.getElementsByTagName('img')];
 
     const urls = imgs.flatMap((img) => {
-      // Tìm data-* attribute có giá trị là URL ảnh (logic từ script gốc)
+      // data-* attribute có giá trị là URL ảnh (từ NewtokiRipper-1.5)
       const attrs = [...img.attributes];
       const dataAttr = attrs.find((a) => /^data-[a-zA-Z0-9]{1,20}/.test(a.name));
       const src = dataAttr?.value;
@@ -310,7 +289,7 @@ async function getImageUrls(page, chapterUrl) {
 
       // Fallback 2: bất kỳ data-* nào dạng URL ảnh
       for (const attr of attrs) {
-        if (/^data-/.test(attr.name) && attr.value?.startsWith('http') && /\.(jpg|jpeg|png|webp)/.test(attr.value)) {
+        if (/^data-/.test(attr.name) && attr.value?.startsWith('http') && /\.(jpg|jpeg|png|webp)/i.test(attr.value)) {
           return [attr.value];
         }
       }
@@ -318,11 +297,9 @@ async function getImageUrls(page, chapterUrl) {
       return [];
     });
 
-    // Loại bỏ trùng lặp và giữ thứ tự
     return [...new Set(urls)];
   });
 
-  // Lấy thông tin chapter
   const chapterInfo = await page.evaluate(() => {
     const titleEl = document.querySelector('.view-title, h1, .toon-title, .subject');
     return {
@@ -356,7 +333,6 @@ async function autoScroll(page) {
     });
   });
 
-  // Chờ lazy images load
   await page.waitForTimeout(1000);
 }
 
